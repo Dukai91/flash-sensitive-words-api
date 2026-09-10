@@ -1,0 +1,42 @@
+services:
+  sqlserver:
+    image: mcr.microsoft.com/mssql/server:2022-CU26-ubuntu-22.04
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_PID: Developer
+      MSSQL_SA_PASSWORD: ${MSSQL_SA_PASSWORD:-FlashLocal_Only!2026}
+    ports:
+      - "127.0.0.1:${MSSQL_PORT:-1433}:1433"
+    volumes:
+      - sqlserver-data:/var/opt/mssql
+    healthcheck:
+      test: ["CMD-SHELL", "SQLCMDPASSWORD=\"$$MSSQL_SA_PASSWORD\" /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -C -b -Q 'SELECT 1' -o /dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+  db-init:
+    image: mcr.microsoft.com/mssql/server:2022-CU26-ubuntu-22.04
+    depends_on:
+      sqlserver:
+        condition: service_healthy
+    environment:
+      SQLCMDPASSWORD: ${MSSQL_SA_PASSWORD:-FlashLocal_Only!2026}
+    entrypoint: ["/opt/mssql-tools18/bin/sqlcmd"]
+    command: ["-S", "sqlserver", "-U", "sa", "-C", "-b", "-Q", "IF DB_ID(N'sensitive_words') IS NULL CREATE DATABASE sensitive_words"]
+    restart: "no"
+  app:
+    build: .
+    environment:
+      DB_URL: "jdbc:sqlserver://sqlserver:1433;databaseName=sensitive_words;encrypt=true;trustServerCertificate=true"
+      DB_USERNAME: sa
+      DB_PASSWORD: ${MSSQL_SA_PASSWORD:-FlashLocal_Only!2026}
+      SANITIZATION_MAX_MESSAGE_LENGTH: ${SANITIZATION_MAX_MESSAGE_LENGTH:-10000}
+    ports:
+      - "127.0.0.1:${APP_PORT:-8080}:8080"
+    depends_on:
+      db-init:
+        condition: service_completed_successfully
+    stop_grace_period: 30s
+volumes:
+  sqlserver-data:
