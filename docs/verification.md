@@ -1,25 +1,66 @@
 # Verification record
 
-Verified locally on 10 September 2026 using Java 21.0.9, Maven 3.9.11, Docker Desktop's Linux engine and actual Microsoft SQL Server 2022 CU26.
+Verified locally on 10 September 2026 against implementation commit **3e7df79bc8ad187e8ab34f368339057afa6c4972**. The subsequent verification-record commit changes documentation only.
+
+Environment: Windows, Java 21.0.9, Maven wrapper 3.9.11, Docker Desktop Linux engine, actual Microsoft SQL Server 2022 CU26. The container uses the pinned Java 21 runtime in the Dockerfile.
 
 | Check | Result |
-| --- | --- |
-| `mvn clean verify` (via the included Maven wrapper) | 84 tests passed; zero failures, errors or skipped tests |
-| `mvn clean verify -Pintegration` | The same 84 tests plus 5 MSSQL integration tests passed; none skipped |
-| JaCoCo, combined unit/controller/integration run | 173 of 177 executable lines covered (97.7%); not a throughput measurement |
-| `docker compose up --build -d` | Image built, SQL Server healthy, database initializer exited 0, application healthy |
-| Container identity | Runtime UID/GID 999, user `app` |
-| Flyway / Hibernate | Both migrations applied to fresh SQL Server; schema validation succeeded |
-| Seed data | All 228 database entries matched the supplied list exactly and in seed order |
-| Sanitization over HTTP | Upper/lower/mixed case, repeated/multiple terms, punctuation and word boundaries passed |
-| Flash regression | `SELECT * FROM sensitiveWords` returned `****** * FROM sensitiveWords`, including through Swagger's interactive request UI |
-| Live CRUD | Create/get/list/update/delete, duplicate 409, missing 404 and matcher refresh after each mutation passed |
-| OpenAPI / Swagger | All six operations rendered; request examples and resolved error schemas checked; error examples carry the corresponding HTTP status |
-| Health | General, liveness and readiness endpoints available; database included in readiness; other actuator endpoints not exposed |
-| Repository | Generated build outputs and local secrets excluded; logical local Git commits |
+|---|---|
+| `./mvnw -B -ntp clean verify -Pintegration` | 119 unit/controller/security tests and 11 MSSQL integration tests passed: **130 total**, zero failures/errors/skips |
+| Normal suite inside Docker build | 119 tests passed without a database dependency |
+| JaCoCo, clean combined run | **385/400 lines (96.25%)**, 154/184 branches (83.70%) |
+| Actual MSSQL | Dedicated test database; encrypted connection with development certificate trust |
+| Flyway | V1/V2 exact seeding and V3 Unicode/version upgrade; existing-term upgrade and collision rollback verified |
+| Supplied dataset | All 228 source entries preserved and compared against the migration/database |
+| Transactions | Flushed vocabulary/revision rollback; actual commit followed by simulated lost acknowledgement; reconciliation restores trusted state |
+| Concurrency | Deterministic old/new snapshot observations; independent-instance duplicate race; replica version propagation |
+| Failure behaviour | Real SQL lock deadline, unavailable startup/cache, configured stale expiry, invalid settings and recovery |
+| HTTP contracts | Strict string JSON, duplicate/trailing input 400, pagination bounds, Unicode whitespace, body-byte 413 and safe violations |
+| Production security | Missing/invalid JWT 401; scope separation and 403; Swagger denied; development database settings rejected |
+| Timestamps | Create/read/update round trips preserve microsecond values and creation time |
+| Container build | Completed with cached Maven downloads, stable JAR name and non-root runtime |
+| Existing local database upgrade | V3 applied successfully; local volume retained |
+| Deployed HTTP smoke | Passed against the rebuilt container, including the exact Flash example, Unicode CRUD, duplicate detection and matcher refresh |
+| Swagger/OpenAPI | Effective text limit, Location header, routes and error contracts checked |
+| Health | App and SQL containers healthy; liveness independent of database; readiness follows matcher freshness |
+| Migration release tooling | Pinned `flyway:info` command sees all three successful SQL/Java migrations |
+| JMH | Exploratory run completed; methodology, uncertainty and observations in [benchmark.md](benchmark.md) |
+| Git | Implementation committed; generated outputs, logs and local secrets excluded |
 
-The integration tests use a fresh disposable SQL Server container rather than H2 or a reused local database. Compose's first start also used a newly created named volume; later rebuilds confirmed startup with existing migrations. Temporary smoke-test terms were removed after verification.
+The final deployed smoke command used Python 3:
 
-The final review found and fixed Springdoc pruning the shared ProblemDetail schema before the response customizer added references to it. The schema is now registered alongside those references, with a regression assertion against the generated OpenAPI document. Status-specific examples prevent a 409/500 response from showing a generic 400 example.
+```sh
+python scripts/smoke.py --url http://127.0.0.1:8080
+```
 
-Scope: this verifies the local implementation and container setup. The GitHub Actions workflow is supplied but has not been run on a hosted repository. No production deployment, hosted Git publication, load benchmark, distributed matcher synchronization or production authorization was performed or claimed.
+It deletes only its own uniquely named temporary term. Existing application data was retained. Integration tests use disposable containers/databases and clean up their own records.
+
+## Vulnerability verification
+
+Trivy **0.74.0** scanned the rebuilt application image's OS and Java dependencies:
+
+```sh
+trivy image --scanners vuln --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 flash-sensitive-words:local
+```
+
+Result: **zero fixable HIGH/CRITICAL findings**, exit code 0.
+
+Trivy recorded image identifier:
+
+```text
+sha256:a78c352579f466bdcd9df11bca5c3d2341fb01a8732be3a9187e19a06cd35289
+```
+
+The first scan identified critical advisories in Tomcat 10.1.55 and an ambiguous JDBC version finding. The tested image uses Tomcat 10.1.59 and Microsoft JDBC 13.4.0.jre11. No vulnerability suppression file was added.
+
+This scan does not assert the absence of lower-severity or unfixed vulnerabilities, and results depend on the advisory database at scan time. CI repeats this gate on future changes.
+
+## Scope and remaining external work
+
+The GitHub Actions workflow is supplied and its test/build/smoke/scan steps have been exercised locally. **It has not run on a hosted repository**, and no remote repository or sharing link is configured yet.
+
+Production JWT enforcement is implemented and authorization-tested with a mock decoder; integration with Flash's real issuer, audience, keys and issued tokens still needs staging verification. Private ingress, actual runtime grants, secrets, image signing, deployment, HA/backups and operational dashboards require Flash's infrastructure.
+
+Cross-instance propagation is periodic eventual consistency, not an immediate global guarantee. Administrative edits intentionally retain the documented last-write-wins policy. The benchmark is not an HTTP load test or a production SLO.
+
+See [review-resolution.md](review-resolution.md) for the disposition of every review finding.
