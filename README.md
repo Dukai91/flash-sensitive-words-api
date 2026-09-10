@@ -90,7 +90,7 @@ flowchart LR
 
 Controllers handle HTTP contracts. Application services own orchestration and transactions. The `domain` package contains shared term rules; `matcher` contains matching and snapshot publication; `persistence` contains JPA. DTOs do not depend on entities. Configuration contains serialization, health and security adapters.
 
-Each sanitize request reads one immutable snapshot and creates its own regex matcher. It does not query MSSQL or acquire an application write lock. Original and sanitized messages are not routinely logged. The original-text response is required by this assessment's API contract; consumers must redact their own response logs.
+Each sanitize request reads one immutable snapshot and creates its own regex matcher. It does not query MSSQL or acquire an application write lock. Original and sanitized messages are not routinely logged. This implementation returns both the original and sanitized values in an explicit response DTO for API clarity. Consumers should avoid logging message payloads containing potentially sensitive content.
 
 ## Matching contract
 
