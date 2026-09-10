@@ -22,7 +22,6 @@ import org.testcontainers.containers.MSSQLServerContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 import za.co.flash.sensitivewords.application.SensitiveWordService;
-import za.co.flash.sensitivewords.exception.DuplicateWordException;
 import za.co.flash.sensitivewords.matcher.MatcherCache;
 
 @Testcontainers
@@ -121,9 +120,13 @@ class SqlServerIT {
         mvc.perform(get("/swagger-ui.html")).andExpect(status().is3xxRedirection());
         mvc.perform(get("/swagger-ui/index.html")).andExpect(status().isOk());
         var spec = mvc.perform(get("/v3/api-docs")).andExpect(status().isOk()).andReturn().getResponse().getContentAsString();
-        var paths = json.readTree(spec).get("paths");
+        var document = json.readTree(spec);
+        assertThat(document.at("/components/schemas/ApiProblem/properties/status/type").asText()).isEqualTo("integer");
+        var paths = document.get("paths");
         assertThat(paths.get("/api/v1/sanitize").get("post").get("responses").has("200")).isTrue();
         assertThat(paths.get(WORDS).get("post").get("responses").has("409")).isTrue();
+        assertThat(paths.get(WORDS).get("post").get("responses").get("409")
+                .get("content").get("application/problem+json").get("example").get("status").asInt()).isEqualTo(409);
         assertThat(paths.get(WORDS).has("get")).isTrue();
         assertThat(paths.get(WORDS + "/{id}").has("get")).isTrue();
         assertThat(paths.get(WORDS + "/{id}").has("put")).isTrue();
