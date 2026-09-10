@@ -8,6 +8,20 @@ import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 class SensitiveWordMatcherTest {
+    @ParameterizedTest
+    @ValueSource(strings = {"İSTANBUL", "ı", "ς", "σ", "Σ", "K", "ſ", "ß", "ẞ", "𐐀", "é", "é"})
+    void everyAcceptedUnicodeTermMatchesItself(String term) {
+        assertThat(SensitiveWordMatcher.compile(List.of(term)).sanitize(term))
+                .isEqualTo("*".repeat(term.codePointCount(0, term.length())));
+    }
+
+    @Test
+    void exposesTheGeneralPhrasePrecedenceAndUnicodeEquivalenceRules() {
+        assertThat(SensitiveWordMatcher.compile(List.of("foo", "foo bar")).sanitize("foo bar")).isEqualTo("*** bar");
+        assertThat(SensitiveWordMatcher.compile(List.of("σ")).sanitize("σ ς Σ")).isEqualTo("* * *");
+        assertThat(SensitiveWordMatcher.compile(List.of("\u00a0CREATE\u202f")).sanitize("CREATE")).isEqualTo("******");
+    }
+
     private final SensitiveWordMatcher matcher = SensitiveWordMatcher.compile(
             List.of("CREATE", "TABLE", "DROP", "ORDER", "SELECT", "SELECT * FROM"));
 

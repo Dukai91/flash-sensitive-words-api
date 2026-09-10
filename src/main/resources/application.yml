@@ -8,6 +8,12 @@ spring:
     hikari:
       maximum-pool-size: ${DB_POOL_SIZE:10}
       connection-timeout: 5000
+      data-source-properties:
+        queryTimeout: 10
+        cancelQueryTimeout: 5
+        lockTimeout: 5000
+        socketTimeout: 20000
+        loginTimeout: 10
   jpa:
     open-in-view: false
     hibernate:
@@ -38,7 +44,11 @@ management:
         enabled: true
       group:
         readiness:
-          include: readinessState,db
+          include: readinessState,matcher
+vocabulary:
+  refresh-delay-ms: ${VOCABULARY_REFRESH_DELAY_MS:30000}
+  max-stale-seconds: ${VOCABULARY_MAX_STALE_SECONDS:300}
+  max-terms: ${VOCABULARY_MAX_TERMS:10000}
 sanitization:
   max-message-length: ${SANITIZATION_MAX_MESSAGE_LENGTH:10000}
 springdoc:

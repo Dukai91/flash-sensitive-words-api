@@ -4,7 +4,7 @@ import java.util.Collection;
 import java.util.Comparator;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
-import za.co.flash.sensitivewords.application.TermNormalizer;
+import za.co.flash.sensitivewords.domain.TermNormalizer;
 
 /** Immutable and safe to share; each invocation creates its own regex Matcher. */
 public final class SensitiveWordMatcher {
@@ -21,28 +21,34 @@ public final class SensitiveWordMatcher {
                 .sorted(Comparator.comparingInt(String::length).thenComparing(Comparator.naturalOrder()))
                 .map(Pattern::quote).collect(Collectors.joining("|"));
         return new SensitiveWordMatcher(alternatives.isEmpty() ? null : Pattern.compile(
-                "(?<!" + TOKEN_CHARACTER + ")(?:" + alternatives + ")(?!" + TOKEN_CHARACTER + ")",
-                Pattern.CASE_INSENSITIVE | Pattern.UNICODE_CASE));
+                "(?<!" + TOKEN_CHARACTER + ")(?:" + alternatives + ")(?!" + TOKEN_CHARACTER + ")"));
     }
 
     public String sanitize(String text) {
         if (pattern == null) {
             return text;
         }
-        var matcher = pattern.matcher(text);
-        StringBuilder result = new StringBuilder(text.length());
+        // Simple folding is shared with duplicate identity. On Java 21 it preserves
+        // UTF-16 offsets; an exhaustive runtime invariant test protects that contract.
+        var matcher = pattern.matcher(TermNormalizer.foldCase(text));
+        StringBuilder result = null;
         int last = 0;
         while (matcher.find()) {
+            if (result == null) {
+                result = new StringBuilder(text.length());
+            }
             result.append(text, last, matcher.start());
-            text.substring(matcher.start(), matcher.end()).codePoints().forEach(codePoint -> {
-                if (Character.isWhitespace(codePoint) || Character.isSpaceChar(codePoint)) {
+            for (int offset = matcher.start(); offset < matcher.end();) {
+                int codePoint = text.codePointAt(offset);
+                if (TermNormalizer.isSpace(codePoint)) {
                     result.appendCodePoint(codePoint);
                 } else {
                     result.append('*');
                 }
-            });
+                offset += Character.charCount(codePoint);
+            }
             last = matcher.end();
         }
-        return last == 0 ? text : result.append(text, last, text.length()).toString();
+        return result == null ? text : result.append(text, last, text.length()).toString();
     }
 }

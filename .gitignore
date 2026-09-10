@@ -5,6 +5,11 @@ target/
 *.log
 logs/
 .env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
 !.env.example
 .DS_Store
 Thumbs.db

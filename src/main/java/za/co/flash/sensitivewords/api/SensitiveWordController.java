@@ -3,6 +3,8 @@ package za.co.flash.sensitivewords.api;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.Parameter;
 import io.swagger.v3.oas.annotations.responses.ApiResponse;
+import io.swagger.v3.oas.annotations.headers.Header;
+import io.swagger.v3.oas.annotations.media.Schema;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.Max;
@@ -11,7 +13,6 @@ import jakarta.validation.constraints.Positive;
 import org.springframework.data.web.PagedModel;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
-import org.springframework.web.servlet.support.ServletUriComponentsBuilder;
 import za.co.flash.sensitivewords.application.SensitiveWordService;
 import za.co.flash.sensitivewords.dto.SensitiveWordRequest;
 import za.co.flash.sensitivewords.dto.SensitiveWordResponse;
@@ -28,10 +29,11 @@ public class SensitiveWordController {
 
     @PostMapping(consumes = "application/json")
     @Operation(summary = "Create a sensitive term and refresh the local matcher")
-    @ApiResponse(responseCode = "201", description = "Created; Location header identifies the resource")
+    @ApiResponse(responseCode = "201", description = "Created",
+            headers = @Header(name = "Location", description = "URI of the created resource", schema = @Schema(type = "string", format = "uri-reference")))
     public ResponseEntity<SensitiveWordResponse> create(@Valid @RequestBody SensitiveWordRequest request) {
         var response = service.create(request.word());
-        var location = ServletUriComponentsBuilder.fromCurrentRequest().path("/{id}").buildAndExpand(response.id()).toUri();
+        var location = java.net.URI.create("/api/v1/internal/sensitive-words/" + response.id());
         return ResponseEntity.created(location).body(response);
     }
 
@@ -41,6 +43,7 @@ public class SensitiveWordController {
     public PagedModel<SensitiveWordResponse> list(
             @Parameter(description = "Zero-based page number") @RequestParam(defaultValue = "0") @Min(0) int page,
             @Parameter(description = "Page size, 1 to 100") @RequestParam(defaultValue = "20") @Min(1) @Max(100) int size) {
+        SensitiveWordService.validatePage(page, size);
         return new PagedModel<>(service.list(page, size));
     }
 

@@ -9,7 +9,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.regex.Pattern;
 import org.junit.jupiter.api.Test;
-import za.co.flash.sensitivewords.application.TermNormalizer;
+import za.co.flash.sensitivewords.domain.TermNormalizer;
 import za.co.flash.sensitivewords.matcher.SensitiveWordMatcher;
 
 class SeedSourceTest {

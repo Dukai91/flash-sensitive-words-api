@@ -1,6 +1,13 @@
 package za.co.flash.sensitivewords.exception;
 
 import java.sql.SQLException;
+import java.util.Map;
+import org.springframework.web.bind.MethodArgumentNotValidException;
+import org.springframework.web.method.annotation.HandlerMethodValidationException;
+import org.springframework.http.converter.HttpMessageNotReadableException;
+import org.springframework.dao.TransientDataAccessException;
+import org.springframework.dao.DataAccessResourceFailureException;
+import org.springframework.transaction.TransactionException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.dao.DataIntegrityViolationException;
@@ -13,6 +20,13 @@ import org.springframework.web.servlet.mvc.method.annotation.ResponseEntityExcep
 @RestControllerAdvice
 public class ApiExceptionHandler extends ResponseEntityExceptionHandler {
     private static final Logger log = LoggerFactory.getLogger(ApiExceptionHandler.class);
+
+    @ExceptionHandler({TransientDataAccessException.class, DataAccessResourceFailureException.class, TransactionException.class})
+    ProblemDetail dependency(Exception exception) {
+        log.warn("Database request failed; failure={}", exception.getClass().getSimpleName());
+        return ProblemDetail.forStatusAndDetail(HttpStatus.SERVICE_UNAVAILABLE,
+                "Database operation unavailable; a write may have committed. Read the resource before retrying");
+    }
 
     @ExceptionHandler(InvalidInputException.class)
     ProblemDetail invalid(InvalidInputException exception) {
@@ -62,6 +76,21 @@ public class ApiExceptionHandler extends ResponseEntityExceptionHandler {
             case 415 -> "The request content type must be application/json";
             default -> "The request could not be processed";
         };
-        return super.handleExceptionInternal(exception, ProblemDetail.forStatusAndDetail(status, detail), headers, status, request);
+        ProblemDetail problem = ProblemDetail.forStatusAndDetail(status, detail);
+        if (exception instanceof MethodArgumentNotValidException validation) {
+            problem.setDetail("Request fields failed validation");
+            problem.setProperty("violations", validation.getBindingResult().getFieldErrors().stream()
+                    .map(error -> Map.of("field", error.getField(), "message",
+                            java.util.Objects.requireNonNullElse(error.getDefaultMessage(), "Invalid value"))).toList());
+        } else if (exception instanceof HandlerMethodValidationException validation) {
+            problem.setDetail("Request parameters failed validation");
+            problem.setProperty("violations", validation.getParameterValidationResults().stream()
+                    .flatMap(result -> result.getResolvableErrors().stream().map(error -> Map.of(
+                            "field", java.util.Objects.requireNonNullElse(result.getMethodParameter().getParameterName(), "parameter"),
+                            "message", java.util.Objects.requireNonNullElse(error.getDefaultMessage(), "Invalid value")))).toList());
+        } else if (exception instanceof HttpMessageNotReadableException) {
+            problem.setDetail("Body must be one JSON object with unique properties and string field values");
+        }
+        return super.handleExceptionInternal(exception, problem, headers, status, request);
     }
 }

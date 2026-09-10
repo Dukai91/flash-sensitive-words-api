@@ -1,161 +1,190 @@
 # Flash Sensitive Words API
 
-A Java 21 / Spring Boot service that replaces configured sensitive terms in chat messages with stars. Microsoft SQL Server stores the vocabulary; sanitization uses an immutable in-memory matcher. Administrative CRUD updates the database and replaces the local matcher after a successful commit.
+Java 21 / Spring Boot 3.5.16 REST service that replaces configured sensitive terms with stars. Microsoft SQL Server stores the vocabulary; messages are matched in memory. Administrative edits commit a new vocabulary version, then publish an immutable local matcher.
+
+[Quick start](#quick-start) · [Walkthrough](#five-minute-walkthrough) · [Matching](#matching-contract) · [API](#api) · [Consistency](#transactions-and-configuration-consistency) · [Tests](#testing-and-verification) · [Performance](#performance-what-would-enhance-this-project) · [Production](#production-deployment)
 
 ## Quick start
 
-From the repository root, with Docker Engine/Desktop running in Linux-container mode:
+With Docker Desktop/Engine running in Linux-container mode:
 
 ```sh
-docker compose up --build
+docker compose up --build -d --wait --wait-timeout 180
 ```
 
-The first run downloads SQL Server and Java images and Maven dependencies. Allow a few minutes. SQL Server needs an x86-64 host and sufficient memory; allocate at least 4 GB to Docker for this local stack, preferably 6 GB when also running integration tests. Compose uses SQL Server Developer edition for development/testing only. Starting the SQL Server container accepts Microsoft's container license terms.
+The initial image build can take several minutes to download Maven dependencies. The wait timeout applies to container health after the build. SQL Server needs an x86-64 host; allocate at least 4 GB to Docker, preferably 6 GB when running integration tests too. SQL Server Developer edition is for development/testing only; starting the container accepts Microsoft's license terms.
 
-Compose waits for SQL Server's health check, creates the `sensitive_words` database through a one-shot initialization service, then starts the application. Flyway creates the schema and inserts all 228 supplied entries. An exited `db-init` container with exit code 0 is expected.
+Compose creates the application database, Flyway applies migrations and preloads all 228 supplied entries. An exited `db-init` container with code 0 is normal. The application container health check tests **liveness**; confirm **readiness** before sending traffic.
 
-| Resource | URL |
-| --- | --- |
+| Resource | Local URL |
+|---|---|
 | Swagger UI | http://localhost:8080/swagger-ui.html |
 | OpenAPI JSON | http://localhost:8080/v3/api-docs |
-| Health | http://localhost:8080/actuator/health |
-| Liveness | http://localhost:8080/actuator/health/liveness |
 | Readiness | http://localhost:8080/actuator/health/readiness |
+| Liveness | http://localhost:8080/actuator/health/liveness |
+| Dependency health | http://localhost:8080/actuator/health |
 
 ```sh
-curl -sS http://localhost:8080/api/v1/sanitize \
-  -H 'Content-Type: application/json' \
-  -d '{"text":"SELECT * FROM sensitiveWords"}'
+curl --fail http://localhost:8080/actuator/health/readiness
+curl -sS http://localhost:8080/api/v1/sanitize -H 'Content-Type: application/json' -d '{"text":"You need to create a string"}'
 ```
 
 ```json
-{"original":"SELECT * FROM sensitiveWords","sanitized":"****** * FROM sensitiveWords"}
+{"original":"You need to create a string","sanitized":"You need to ****** a string"}
 ```
 
-On Windows PowerShell, use the native equivalent to avoid shell-specific curl quoting:
+PowerShell equivalent:
 
 ```powershell
-Invoke-RestMethod http://localhost:8080/api/v1/sanitize -Method Post `
-  -ContentType 'application/json' -Body '{"text":"SELECT * FROM sensitiveWords"}'
+Invoke-RestMethod http://localhost:8080/actuator/health/readiness
+Invoke-RestMethod http://localhost:8080/api/v1/sanitize -Method Post -ContentType 'application/json' -Body '{"text":"You need to create a string"}'
 ```
+
+Both exposed ports bind to loopback. Local mode intentionally permits unauthenticated requests. Production mode requires JWTs and different database settings.
+
+## Five-minute walkthrough
+
+1. Start Compose, open Swagger and run the email example above.
+2. Run the PDF regression: `SELECT * FROM sensitiveWords` → `****** * FROM sensitiveWords`.
+3. Create `CONFIDENTIAL`, sanitize it, rename it to `CLASSIFIED`, then delete it. Explain the version-row transaction and publication after commit.
+4. Show a duplicate 409, malformed request 400, and the generated response schemas.
+5. Run `./mvnw clean verify -Pintegration` and explain the rollback, uncertain-commit and two-instance tests.
+6. Explain phrase precedence, Unicode policy, bounded stale configuration, last-write-wins edits, and production access controls.
+
+The optional automated local walkthrough `python scripts/smoke.py` requires Python 3 and creates/deletes its own uniquely named term. It also checks strict JSON, pagination, timestamps and OpenAPI. It is intended for the unauthenticated local stack.
 
 ## Assessment requirements
 
-The original [PDF](docs/assessment/Interview-SqlWords.pdf) and [word list](docs/assessment/sql_sensitive_list.txt) are retained in the repository. Both were read before implementation. MSSQL follows the email requirement, even though the PDF permits a database of choice.
+The original [PDF](docs/assessment/Interview-SqlWords.pdf) and [word list](docs/assessment/sql_sensitive_list.txt) are retained. MSSQL follows the email requirement even though the PDF allows a database of choice.
 
-| Requirement | Implementation |
-| --- | --- |
-| Java / REST | Java 21, Spring Boot 3.5.16, versioned controllers |
-| External business endpoint | `POST /api/v1/sanitize` |
-| Internal database CRUD | `/api/v1/internal/sensitive-words` |
-| MSSQL | SQL Server 2022 CU26, Spring Data JPA, Microsoft JDBC driver |
-| Schema and preload | Flyway V1/V2; Hibernate schema validation |
-| Swagger | Springdoc 2.8.17; operations, DTOs, examples, parameters and error codes |
-| Unit/controller tests | JUnit 5, Mockito, AssertJ, MockMvc, JaCoCo report |
-| Database integration tests | Opt-in MSSQL Testcontainers suite; no H2 substitute |
-| Performance | Compiled immutable matcher, no database query per message |
-| Deployment | Multi-stage non-root image, Compose health checks, production walkthrough below |
+| Flash requirement | Implementation |
+|---|---|
+| Java Spring Boot REST | Java 21, Boot 3.5.16, versioned endpoints and explicit record DTOs |
+| Sanitize an incoming string | `POST /api/v1/sanitize`, original and sanitized fields |
+| Manage sensitive words | Create, read, paginated list, update and delete |
+| MSSQL persistence | SQL Server 2022 CU26, JPA, Microsoft JDBC, Flyway |
+| Swagger annotations | Springdoc 2.8.17, operations, parameters, request constraints, headers and error responses |
+| Appropriate unit tests | JUnit, Mockito, MockMvc, security tests and JaCoCo |
+| Performance enhancements | Implemented in-memory matching and repeatable JMH profile; discussion below |
+| Additional enhancements | Implemented controls and remaining platform work explicitly separated below |
+| Production walkthrough | Concrete identity, migration, health, rollout and recovery policies below |
+| Git submission | Logical commits; publish to a repository accessible to Flash and provide that URL |
 
-Spring Boot 3.5.16 is the stable 3.x release selected for this assessment, rather than changing the required major version. Java 21 is within its [documented compatibility range](https://docs.spring.io/spring-boot/3.5/system-requirements.html). Springdoc 2.8.x follows the [Boot 3.5 compatibility matrix](https://springdoc.org/v2/#what-is-the-compatibility-matrix-of-springdoc-openapi-with-spring-boot). Spring Boot manages the remaining platform dependency versions. Reassess supported versions and security advisories before production deployment.
+Spring Boot manages platform dependency versions. Springdoc 2.8.x follows its [Boot 3.5 compatibility matrix](https://springdoc.org/v2/#what-is-the-compatibility-matrix-of-springdoc-openapi-with-spring-boot). Reassess dependency support and vulnerability findings before production release.
 
-## Architecture and data flow
+Two explicit security overrides are tested: Tomcat 10.1.59 and Microsoft JDBC 13.4.0.jre11. The initial image scan flagged Tomcat advisories affecting the BOM's 10.1.55. Apache's 10.1.58 candidate did not pass its release vote, so the published 10.1.59 is used. The JDBC update also removes an ambiguous scanner version match against the older driver's JRE-suffixed version. See [Apache advisories](https://tomcat.apache.org/security-10.html) and [Microsoft's 13.4 release](https://techcommunity.microsoft.com/blog/sqlserver/announcing-the-general-availability-of-microsoft-jdbc-driver-13-4-for-sql-server/4503168). Remove overrides once the Boot BOM incorporates equivalent or newer patched versions.
+
+## Architecture
 
 ```mermaid
 flowchart LR
-    Client[Client application] --> API[SanitizationController]
-    API --> Service[SanitizationService]
-    Service --> Cache[MatcherCache: atomic immutable snapshot]
-    Admin[Internal administrator] --> CRUD[SensitiveWordController]
-    CRUD --> Config[SensitiveWordService]
-    Config --> Repo[SensitiveWordRepository]
-    Repo --> SQL[(SQL Server)]
-    Config -->|publish after commit| Cache
+    Client --> API[HTTP controller]
+    API --> Sanitize[Sanitization service]
+    Sanitize --> Cache[Atomic immutable matcher snapshot]
+    Admin[Authorized administrator] --> CRUD[CRUD service]
+    CRUD --> DB[(MSSQL vocabulary and revision)]
+    CRUD -->|after commit| Cache
+    Poll[Periodic version reconciliation] --> DB
+    Poll --> Cache
 ```
 
-`api` handles HTTP and validation, `application` handles orchestration, `matcher` handles matching and atomic publication, and `persistence` handles JPA. Records in `dto` define explicit API contracts; entities never leave the application layer. `exception` provides centralized ProblemDetail responses, and `config` contains typed settings and OpenAPI configuration. DTO conversion is a small named factory; a separate mapping framework or interface hierarchy would add little here.
+Controllers handle HTTP contracts. Application services own orchestration and transactions. The `domain` package contains shared term rules; `matcher` contains matching and snapshot publication; `persistence` contains JPA. DTOs do not depend on entities. Configuration contains serialization, health and security adapters.
 
-At startup, Flyway migrates the database, Hibernate validates it, and an application runner loads the vocabulary and compiles the matcher. Initialization failure stops startup. Until initialization completes, sanitization returns 503 rather than passing messages through an empty matcher. Spring Boot only declares the application ready after the runner completes.
+Each sanitize request reads one immutable snapshot and creates its own regex matcher. It does not query MSSQL or acquire an application write lock. Original and sanitized messages are not routinely logged. The original-text response is required by this assessment's API contract; consumers must redact their own response logs.
 
-For each message, the application validates the text, reads the atomic matcher reference once, and uses a request-local regex `Matcher`. No database access, shared mutable matching state or application lock is needed on this path. The response includes the original text because that is the requested API contract; neither message value is routinely logged.
+## Matching contract
 
-CRUD writes are serialized within one instance. A `TransactionTemplate` explicitly owns the transaction and its commit boundary. The operation flushes the database changes, reads the resulting terms and compiles a replacement inside that transaction. Only after the commit succeeds is the replacement published. This avoids publishing rolled-back data, avoids a fallible database reload after commit, and prevents concurrent local writes from publishing snapshots out of order. A compilation or commit failure leaves the previous matcher intact. An in-flight reader may finish with its old snapshot; subsequent readers see the replacement after the CRUD response.
+Terms are literal strings. Surrounding Unicode whitespace, including non-breaking spaces, is removed. Empty/control-containing terms are rejected. All stored terms are active; DELETE physically removes a term.
 
-This costs a complete vocabulary read and compilation per administrative write, which is reasonable for 228 terms and rare updates. It is not a distributed transaction: if the process dies immediately after commit, it reloads committed configuration on restart. Multi-instance synchronization is a separate production concern described below.
+Both term identity and incoming text use the same **simple per-code-point case fold**: `lower(upper(codePoint))`. This avoids expanding characters such as `İ` and handles sigma variants consistently. It does not use locale-sensitive casing or multi-character linguistic equivalence: `ß` is not `ss`. Composed/decomposed accents, transliteration and visually similar characters remain distinct.
 
-## Matching semantics and the supplied ambiguity
+Simple folding preserves UTF-16 offsets on Java 21. An exhaustive test checks every runtime code point for this property and folding idempotence, protecting the original-string replacement offsets during JDK upgrades. Matching returns the original spelling outside masked spans.
 
-Terms are literal strings, not regular expressions. They are stripped of surrounding Java whitespace and normalized with `Locale.ROOT` lowercase for duplicate detection. `CREATE`, `create` and ` Create ` are the same configured value. The stored display word keeps its case. The matcher uses Java's Unicode-aware case-insensitive regex matching; it does not transliterate, remove accents, normalize composed/decomposed Unicode, or equate all linguistic spellings. The supplied ASCII vocabulary avoids these linguistic edge cases.
+Boundaries treat Unicode letters, numbers, combining marks and connector punctuation as token characters. Consequently `ORDER` does not match inside `preorder`; `CREATE` does not match `CREATE_table`, `CREATE2` or `éCREATE`. Phrase spacing is literal: `top secret` differs from `top  secret`.
 
-Matching proceeds left to right with non-overlapping matches. At the **same starting position, the shortest complete matching term wins**, with lexicographic ordering as a deterministic tie-breaker. Boundaries treat Unicode letters, numbers, combining marks and connector punctuation (including underscore) as token characters. Thus `ORDER` does not match inside `preorder`, and `CREATE` does not match `CREATE_table`, `CREATE2` or `éCREATE`. Punctuation around a complete term is preserved.
+At the same starting position, the **shortest complete matching term wins**. Matches are non-overlapping and processed left to right. With `foo` and `foo bar`, the result for `foo bar` is `*** bar`. This may shadow a configured phrase and is an explicit product assumption.
 
-Each non-whitespace Unicode code point in a matched span becomes one `*`; whitespace inside a phrase is preserved. Characters outside the span are copied exactly. A supplementary character such as an emoji becomes one star, so UTF-16 length need not be preserved. Phrase whitespace is literal: `top secret` does not match `top  secret`. Configured punctuation is literal and is masked when it belongs to a matched term.
+The supplied vocabulary contains both `SELECT` and `SELECT * FROM`, but Flash's PDF explicitly expects `****** * FROM sensitiveWords`. That example takes precedence. The longer phrase remains in the database; deleting `SELECT` lets it match. `FROM` is not independently seeded. Changing precedence requires changing this policy and its tests, not silently replacing the supplied dataset.
 
-**The source files overlap:** the list includes both `SELECT` and `SELECT * FROM`, but Flash's PDF explicitly shows `****** * FROM sensitiveWords`. That behavioral example is treated as canonical. Shorter-first matching consumes `SELECT`, leaving ` * FROM sensitiveWords` unchanged; `FROM` is not an independent entry in the supplied list. The phrase remains present in the database and is not silently discarded. If `SELECT` is removed, the phrase can match and produces `****** * **** sensitiveWords` instead. This is a deliberate trade-off, not an inferred longest-phrase rule.
+Each non-whitespace Unicode code point inside a match becomes one star; whitespace is preserved. An emoji produces one star, so response UTF-16 length need not equal input length.
 
-Precedence is localized in `SensitiveWordMatcher.compile`; clarification can change the ordering and associated tests without changing the API or database. This rule is based on the start position, not a global preference for any short word anywhere within an overlapping phrase.
-
-| Input | Output with the supplied dataset |
-| --- | --- |
-| `CREATE` / `create` / `CrEaTe` | `******` |
+| Input with the supplied vocabulary | Sanitized |
+|---|---|
+| `CREATE`, `create`, `CrEaTe` | `******` |
 | `Please CREATE a TABLE` | `Please ****** a *****` |
-| `CREATE x CREATE` | `****** x ******` |
 | `CREATE, DROP!` | `******, ****!` |
 | `preorder ORDER` | `preorder *****` |
 | `SELECT * FROM sensitiveWords` | `****** * FROM sensitiveWords` |
 
-This is chat-content filtering, not SQL-injection protection. Database access uses JPA parameter binding. Applications must still use parameterized SQL regardless of this service's output.
+This is configurable content filtering, not SQL-injection protection or comprehensive adversarial moderation. Database clients must still use parameterized SQL.
 
 ## API
 
-All request bodies use `application/json`. Unknown JSON properties are rejected to catch consumer mistakes. Text must be non-null, non-blank and at most `SANITIZATION_MAX_MESSAGE_LENGTH` UTF-16 units (default 10,000; configurable from 1 to 1,000,000). Terms must contain 1–200 characters, have no internal control characters, and cannot consist only of whitespace. The HTTP term field has a 200-unit limit including surrounding whitespace; application normalization then strips that whitespace. IDs must be positive. Collection pages are zero-based with size 1–100, ordered by ascending ID.
+Bodies must be one JSON object with unique property names and actual string values. Unknown fields, numeric/boolean coercion, duplicate properties and trailing JSON are rejected. Text must be nonblank and within the configured UTF-16 limit. Terms are limited to 200 UTF-16 units including surrounding whitespace at the HTTP boundary; normalization then trims.
 
 | Method | Path | Success |
-| --- | --- | --- |
-| POST | `/api/v1/sanitize` | 200, original and sanitized text |
-| POST | `/api/v1/internal/sensitive-words` | 201, DTO and `Location` header |
+|---|---|---|
+| POST | `/api/v1/sanitize` | 200, original and sanitized |
+| POST | `/api/v1/internal/sensitive-words` | 201, DTO and relative `Location` URI |
 | GET | `/api/v1/internal/sensitive-words?page=0&size=20` | 200, content and page metadata |
 | GET | `/api/v1/internal/sensitive-words/{id}` | 200, DTO |
 | PUT | `/api/v1/internal/sensitive-words/{id}` | 200, updated DTO |
-| DELETE | `/api/v1/internal/sensitive-words/{id}` | 204, no body |
+| DELETE | `/api/v1/internal/sensitive-words/{id}` | 204 |
 
-CRUD examples (POSIX shell; replace `229` with the returned ID):
+IDs are positive. Pages are zero-based, size 1–100, sorted by ID; `page * size` must not exceed 2,147,483,647. Spring Data `PagedModel` supplies a stable page representation.
 
 ```sh
-curl -i http://localhost:8080/api/v1/internal/sensitive-words \
-  -H 'Content-Type: application/json' -d '{"word":"CONFIDENTIAL"}'
-curl -sS 'http://localhost:8080/api/v1/internal/sensitive-words?page=0&size=20'
-curl -sS http://localhost:8080/api/v1/internal/sensitive-words/229
-curl -sS -X PUT http://localhost:8080/api/v1/internal/sensitive-words/229 \
-  -H 'Content-Type: application/json' -d '{"word":"CLASSIFIED"}'
+curl -i http://localhost:8080/api/v1/internal/sensitive-words -H 'Content-Type: application/json' -d '{"word":"CONFIDENTIAL"}'
+# Replace 229 with the returned ID.
+curl http://localhost:8080/api/v1/internal/sensitive-words/229
+curl -X PUT http://localhost:8080/api/v1/internal/sensitive-words/229 -H 'Content-Type: application/json' -d '{"word":"CLASSIFIED"}'
 curl -i -X DELETE http://localhost:8080/api/v1/internal/sensitive-words/229
 ```
 
-The collection uses Spring Data's `PagedModel`, avoiding unstable serialization of `PageImpl`:
+Errors use `application/problem+json`: 400 validation/JSON, 401 missing or invalid production token, 403 insufficient scope, 404 missing resource, 409 duplicate, 413 oversized body, 415 unsupported request media type, 406 unsupported response media type, 503 unavailable dependency/matcher, and 500 unexpected failure. Field/parameter violations contain names and safe messages, never rejected values. A repeated DELETE returns 404.
 
 ```json
-{"content":[{"id":1,"word":"ACTION","createdAt":"2026-09-10T00:00:00Z","updatedAt":"2026-09-10T00:00:00Z"}],"page":{"size":1,"number":0,"totalElements":228,"totalPages":228}}
+{"type":"about:blank","title":"Bad Request","status":400,"detail":"Request fields failed validation","violations":[{"field":"word","message":"must not be blank"}]}
 ```
 
-Errors use `application/problem+json`: 400 for validation/malformed requests, 404 for missing resources (including a second delete), 409 for normalized duplicates, 415 for unsupported request content type, and 500 for unexpected failures. SQL Server duplicate-key codes are mapped to 409 even when a race passes the application's preliminary check. Other integrity failures remain 500. SQL, stack traces and internal exception names are never included in error responses.
+A streaming body filter bounds bytes before JSON parsing, including requests without Content-Length. The limit is `6 * maxMessageLength + 2048` (62,048 bytes by default), allowing escaped UTF-16 and JSON framing. Production ingress should also enforce body limits, rate limits and request deadlines.
 
-```json
-{"type":"about:blank","title":"Conflict","status":409,"detail":"A sensitive word with the same normalized value already exists","instance":"/api/v1/internal/sensitive-words"}
-```
+## Transactions and configuration consistency
 
-## Database and supplied word list
+A singleton database revision row orders writers across instances. Every CRUD transaction first increments that row, then changes the vocabulary, reads/compiles the replacement and commits. Compilation failure rolls back both vocabulary and revision. Local publication happens after commit, under the same local monitor that orders administrative operations.
 
-`V1__create_sensitive_words.sql` creates a bigint identity primary key, `NVARCHAR(200)` display and normalized values, a unique normalized-value constraint and UTC `DATETIME2(6)` timestamps. Binary collation on the normalized key avoids the database's default accent/case collation introducing a different comparison rule. Non-null, column-size and nonblank checks complement application validation. There is no active flag: all persisted terms are effective, and DELETE physically removes a term.
+Reads of revision and vocabulary retain a shared revision-row lock until the refresh transaction ends. Writers always obtain that row first, so polling cannot pair an old vocabulary with a new revision. Polls normally read only the version and rebuild only when it changes.
 
-`V2__seed_sensitive_words.sql` was generated directly from the supplied JSON-format `.txt` file, without substitutions. The seed test compares every inserted display value and normalized value with that source. Seed migration runs once; restarting does not restore deleted terms or duplicate rows. Never edit an applied migration; use a new version for subsequent changes. Hibernate uses `ddl-auto: validate` and does not own schema changes.
+Each instance polls every 30 seconds by default. This is eventual consistency across replicas: an update acknowledged by A may still be absent on B until its next successful poll. It is not globally immediate consistency. A trusted snapshot remains usable for at most 300 seconds since its last successful database confirmation. After that, readiness is down and sanitization returns 503. An expired snapshot can recover on a successful version confirmation.
 
-Use the administrative API for configuration changes. Direct SQL edits bypass normalization and local refresh and are not a supported configuration workflow. Database uniqueness still protects the normalized key from concurrent duplicate inserts. The local stack uses `sa` for convenient initialization/migration; this is not the production privilege model.
+A transaction/data-access failure invalidates the affected instance's snapshot conservatively because the database might have committed while its acknowledgement was lost. Reconciliation reloads confirmed state; it never replays the write. A caller receiving a failed write must inspect the resource before retrying. The test suite simulates a real commit followed by a thrown acknowledgement error.
 
-## Local development and Docker operations
+Mutation/refresh methods reject ambient transactions rather than independently committing inside another service's transaction. Public reads use bounded read-only transactions. SQL defaults are: query/transaction 10 seconds, lock 5 seconds, cancellation 5 seconds, socket 20 seconds, login 10 seconds; pool acquisition is independently bounded at 5 seconds. These are starting operational budgets, not a strict end-to-end latency guarantee.
 
-No host JDK or Maven is needed for Compose. For development outside the app container, install JDK 21 and use Maven 3.6.3+ or the included Maven 3.9.11 wrapper:
+Vocabulary capacity defaults to 10,000. Full rebuilds remain appropriate for the supplied 228 terms and infrequent edits. Updates are **last-write-wins**; serialization does not detect stale administrator edits. A human editing workflow can add a version/ETag contract. This assessment intentionally does not add that API requirement.
+
+## Database and migrations
+
+V1 creates identity IDs, `NVARCHAR(200)` values, a binary-collated unique normalized key, blank checks and UTC `DATETIME2(6)` timestamps. Java timestamps use matching microsecond precision. Database constraints protect the normalized key; they do not independently implement Java Unicode normalization.
+
+V2 inserts every supplied value exactly once. Tests compare all 228 values and normalized keys against the original source. Restarting does not restore deleted words.
+
+V3 upgrades existing user-added terms to the new Unicode policy and creates the revision row. A newly exposed normalization collision aborts migration without deleting rows. Resolve duplicate terms with the previous application version, then retry. **The upgrade from V2 to V3 requires a maintenance window:** stop old writers before migration; old binaries do not participate in the revision protocol. Subsequent compatible releases can use rolling deployment.
+
+Never edit an applied migration. The Java migration freezes its normalization algorithm and checksum. Hibernate validates schema; it does not create it.
+
+The release job can run `./mvnw -B -ntp compile flyway:migrate` with `FLYWAY_URL`, `FLYWAY_USER` and `FLYWAY_PASSWORD` injected for the migration identity. The pinned Maven plugin loads both SQL and compiled Java migrations. `flyway:info` inspects migration status without applying changes. Keep migration secrets out of command arguments and logs.
+
+Use the administrative API for all vocabulary changes. Direct SQL bypasses normalization and revision updates and is unsupported. Runtime grants are illustrated in [runtime-permissions.sql](deploy/runtime-permissions.sql); login/secret provisioning and a separate migration identity belong to the deployment platform.
+
+## Local development and operations
+
+No host JDK/Maven is needed for Docker. Host development uses JDK 21 and the Maven 3.9.11 wrapper, whose distribution SHA-256 is pinned.
 
 ```sh
-docker compose up -d sqlserver db-init
+docker compose up -d sqlserver
+docker compose run --rm db-init
+# Continue only if the initialization command exits successfully.
 export DB_PASSWORD='FlashLocal_Only!2026'
 ./mvnw spring-boot:run
 ```
@@ -163,24 +192,28 @@ export DB_PASSWORD='FlashLocal_Only!2026'
 PowerShell:
 
 ```powershell
-docker compose up -d sqlserver db-init
+docker compose up -d sqlserver
+docker compose run --rm db-init
+if ($LASTEXITCODE -ne 0) { throw 'Database initialization failed' }
 $env:DB_PASSWORD = 'FlashLocal_Only!2026'
 .\mvnw.cmd spring-boot:run
 ```
 
-If the Compose application already occupies port 8080, stop it with `docker compose stop app` first. Local JDBC defaults connect to `localhost:1433/sensitive_words`; wait for `db-init` to exit successfully before launching the host application.
+Stop the Compose app first if it occupies port 8080: `docker compose stop app`. If overriding the SQL host port, also set the host application's DB_URL. POSIX users should stop if either Docker command fails.
 
-| Environment variable | Purpose / default |
-| --- | --- |
-| `DB_URL` | JDBC URL; defaults to local SQL Server with encryption and development certificate trust |
-| `DB_USERNAME` | Application DB identity; defaults to `sa` for local development |
-| `DB_PASSWORD` | Required when running outside Compose; no application password default |
-| `DB_POOL_SIZE` | Hikari maximum connection pool size; 10 |
-| `SANITIZATION_MAX_MESSAGE_LENGTH` | Text limit; 10,000 UTF-16 units |
-| `MSSQL_SA_PASSWORD` | Compose development password; public local-only default |
-| `MSSQL_PORT` / `APP_PORT` | Compose host ports; 1433 / 8080 |
+| Variable | Default / purpose |
+|---|---|
+| DB_URL | Local MSSQL URL with encryption and development certificate trust |
+| DB_USERNAME / DB_PASSWORD | Local username sa; password required outside Compose |
+| DB_POOL_SIZE | 10 |
+| SANITIZATION_MAX_MESSAGE_LENGTH | 10,000 UTF-16 units; range 1–1,000,000 |
+| VOCABULARY_REFRESH_DELAY_MS | 30,000 milliseconds between completed polls |
+| VOCABULARY_MAX_STALE_SECONDS | 300; range 1–86,400 |
+| VOCABULARY_MAX_TERMS | 10,000; range 228–100,000 |
+| MSSQL_SA_PASSWORD | Public development-only Compose password |
+| MSSQL_PORT / APP_PORT | 1433 / 8080 |
 
-Optionally copy `.env.example` to `.env` to override Compose values. `.env` is ignored by Git. The default password is deliberately public and suitable only for a disposable local database. Both exposed ports bind to loopback. Changing the environment password does not change the existing SQL Server login in a persisted volume: rotate it inside SQL Server or use a new local volume.
+Copy `.env.example` to `.env` for local Compose overrides. Secret file variants are ignored. Changing a password variable does not rotate an existing SQL login in the persisted volume.
 
 ```sh
 docker compose ps -a
@@ -188,105 +221,70 @@ docker compose logs -f app
 docker compose down
 ```
 
-`down` preserves the named database volume. To intentionally erase only this local stack's data and rerun initial seeding, use `docker compose down -v`, then start it again. This deletes local CRUD changes. Do not use it against production data.
+`down` preserves data. `docker compose down -v` intentionally deletes this local stack's database volume and all local CRUD edits. CI uses its own disposable stack.
 
-The Docker build runs the normal test suite, then copies only the packaged application into a Java 21 JRE image. The runtime uses a non-root user and a readiness health check. Base image versions are selected explicitly, though tags can be republished; pin approved image digests in a production release pipeline. Compose is a reviewer/development setup, not a production deployment platform.
+The application image uses a non-root JRE runtime, pinned base digests and a stable JAR filename. Dependency/image updates should arrive through reviewed Dependabot changes. Package repositories used during image assembly remain an external build dependency; artifact promotion should use the same built image digest.
 
-## Testing
+## Testing and verification
 
 ```sh
-mvn clean verify
-# Equivalent without a Maven installation:
 ./mvnw clean verify
-# Windows:
-.\mvnw.cmd clean verify
+./mvnw clean verify -Pintegration
+# Windows: .\mvnw.cmd clean verify -Pintegration
+python scripts/smoke.py
 ```
 
-The normal suite needs JDK 21 and initial Maven repository access, but no database or Docker. It tests matching semantics, the complete source seed, application validation, CRUD orchestration, transaction rollback/commit ordering, concurrent matcher publication and HTTP contracts. JaCoCo writes `target/site/jacoco/index.html`; Surefire writes `target/surefire-reports`. Tests exercise business behavior rather than generated record accessors.
+The default suite requires no database or Docker. It covers literal matching, Unicode invariants, validation, HTTP contracts, security scopes, cache expiry, deterministic publication ordering, startup failure and transaction orchestration.
 
-For actual MSSQL, Docker must be running:
+The integration profile starts an actual disposable MSSQL container, creates a dedicated database, uses encrypted connections with development certificate trust, and verifies migrations, exact seeding, CRUD/timestamp round trips, rollback after flush, uncertain-commit recovery, two-instance refresh, duplicate races and lock deadlines. Docker failure is not silently skipped. No H2 substitute is used.
 
-```sh
-mvn clean verify -Pintegration
-```
+Surefire/Failsafe reports and JaCoCo appear under `target/`. Coverage is supporting evidence, not a performance or correctness proof. See [verification](docs/verification.md) and [review resolutions](docs/review-resolution.md).
 
-The profile adds Failsafe `*IT` tests that create an isolated SQL Server container on a random port and remove it afterward. They verify Flyway and Hibernate compatibility, every supplied seed value, database constraints, complete CRUD with live matcher refresh, simultaneous writes, Swagger/OpenAPI and health. No H2 is used. The profile fails if Docker is unavailable; no tests silently disable themselves. Keeping this explicit means the default assessment build remains easy to run on reviewers' machines. Running tests accepts the SQL Server image license for the disposable test instance.
-
-The GitHub Actions workflow runs the normal suite and the MSSQL integration profile on a Linux runner. Actual throughput claims require a separate benchmark; coverage and concurrency tests do not establish a requests-per-second target.
-
-See the [local verification record](docs/verification.md) for executed checks and their scope.
+CI runs the MSSQL suite, builds/starts the actual image, exercises HTTP smoke tests, and scans runtime OS/JAR dependencies with Trivy. Fixable HIGH/CRITICAL findings fail the gate; unfixed findings still require release risk review. Actions are SHA-pinned. Hosted execution requires publishing this repository; local verification does not establish a hosted CI result.
 
 ## Performance: what would enhance this project?
 
-**Implemented now:** the normal sanitization path is a single in-memory snapshot read and compiled literal regex match. Pattern compilation and full-vocabulary database reads happen at startup and configuration writes. Each request owns its regex state, so readers need no lock. An unchanged message returns its original string. Request length and page size are bounded; database collection reads are paginated; Hikari pools connections; the normalized-key unique index serves duplicate checks. Logging records configuration operations without chat bodies.
+**Implemented:** no database access per message; precompiled immutable patterns; shared simple case-folding policy; no read-side application lock; lazy output allocation and no per-match substring/stream allocation. Messages already in canonical case reuse their input string during folding. Pagination, vocabulary capacity, message/body limits and database deadlines bound work.
 
-**Next, measure:** load-test realistic message sizes, match density, vocabulary size and concurrent writes. Record p50/p95/p99 latency, CPU, allocations, GC pauses and refresh duration. Compare results with the latency/throughput target before altering the algorithm. Regex work can grow with both message length and vocabulary size; literal quoting prevents administrator-supplied regex syntax, but does not make scanning free.
+**Measure first:** the optional JMH profile compares message size, vocabulary size and match density, plus matcher compilation. Run the full matrix with:
 
-If matching dominates CPU at substantially larger vocabularies, benchmark a trie or Aho-Corasick matcher against this implementation, keeping the same boundaries, Unicode and precedence semantics. If GC dominates, profile the result builder and per-match substring allocations before reducing them. Avoid caching chat messages or responses without a privacy and invalidation design.
-
-If administrative traffic grows, benchmark batch imports and one rebuild per batch. For large lists, investigate keyset pagination rather than arbitrarily deep offset pages. Tune connection pools from measured database concurrency: increasing a pool cannot improve the database-free sanitize path and can overload MSSQL. Keep indexes small and query-driven.
-
-For higher total request volume, add instances behind a load balancer **after** solving matcher synchronization. Set CPU/memory limits, JVM heap headroom and autoscaling thresholds from metrics rather than guesses. Rate-limit abusive clients and enforce an HTTP body-byte limit at the gateway: Bean Validation runs after JSON decoding, so the current character limit is not a transport memory cap. Sampling operational logs reduces I/O while preserving useful failure signals.
-
-## Multiple application instances
-
-Each process owns its matcher. This implementation refreshes the instance handling CRUD; other instances retain their old matcher until restarted. Compose therefore runs one app instance. Horizontal scaling without an invalidation policy would be incorrect for prompt propagation requirements.
-
-A modest next step is a database configuration-version row incremented in the same transaction as each edit. Instances periodically check that small value, loading and publishing a consistent vocabulary/version snapshot when it changes. Polling introduces a bounded delay and modest DB traffic; make the interval, retry behavior and stale-age readiness policy explicit. Read the version and terms consistently so a refresh cannot mark an older vocabulary as a newer version.
-
-If Flash requires shorter propagation delays or has many instances, publish invalidation events through existing pub/sub infrastructure and retain version reconciliation for missed events. A transactional outbox can close the commit/event gap. A distributed cache or configuration service may be appropriate if already operated at Flash, but adds availability and operational dependencies. None of these is implemented here. Choose based on consistency requirements, update frequency, instance count, allowed propagation delay and existing infrastructure; do not add Kafka or Redis solely for 228 terms.
-
-## Additional enhancements: what would make it more complete?
-
-| Implemented now | Production / future work and why |
-| --- | --- |
-| Internal route namespace, loopback-only local ports | Enforce administrative authorization with OAuth2/JWT scopes or mTLS/service identity; a URL prefix alone is not access control |
-| Validation, safe ProblemDetail responses, literal matching | Gateway rate limits and body-byte limits to bound abuse before parsing |
-| Atomic local refresh and failure-safe transactions | Distributed invalidation and audit history: know who changed a term and when each instance applied it |
-| Parameterized operational logs, health probes | Correlation IDs, tracing, restricted metrics dashboards and centralized logs with retention/redaction rules |
-| Unit/controller tests and real MSSQL integration suite | Consumer contract tests, repeatable load tests, static analysis and dependency/container vulnerability scanning |
-| CI verification workflow and container packaging | Approved artifact promotion, signed images, automated deployment and rollback gates |
-| Flyway versioning and graceful shutdown | Expand/contract schema changes, backup-restore drills, SQL Server HA and disaster recovery |
-
-No authentication, authorization, audit trail, cross-instance refresh, distributed tracing or automatic retries for CRUD is claimed as implemented. Retrying a write after a network failure requires checking whether it committed; an idempotency design would be preferable to blanket retries.
-
-## Production deployment walkthrough
-
-```mermaid
-flowchart TD
-    Git[Git repository] --> CI[CI: unit, controller and MSSQL integration tests]
-    CI --> Image[Build, scan and sign immutable image]
-    Image --> ECR[Container registry / ECR]
-    ECR --> ECS[ECS service: rolling or blue-green deployment]
-    Clients[Client applications] --> Gateway[API gateway / ALB: TLS and request policy]
-    Gateway --> A[App instance A]
-    Gateway --> B[App instance B]
-    ECS -. deploys .-> A
-    ECS -. deploys .-> B
-    A --> DB[(Private managed / HA SQL Server)]
-    B --> DB
-    Admin[Authorized internal services] --> Private[Private admin ingress]
-    Private --> A
-    Private --> B
+```sh
+./mvnw -Pbenchmark compile exec:exec
 ```
 
-1. **Agree the service contract and consistency target.** Confirm phrase precedence, permitted Unicode behavior, peak traffic and vocabulary propagation delay. Implement the chosen multi-instance version/invalidation policy before running multiple replicas. Define SLOs and how stale configuration affects readiness.
-2. **Verify and package in CI.** Run `mvn clean verify -Pintegration`, contract checks and security scans on a Docker-capable runner. Build once, tag by Git SHA, scan/sign, and push to ECR. Promote the same digest through staging and production; do not rebuild per environment. The supplied CI covers verification; registry publication and deployment require Flash's credentials and approvals.
-3. **Provision a private database.** Use a supported SQL Server deployment with appropriate production licensing, HA/failover, encrypted storage, automatic backups and point-in-time recovery. Set retention against RPO/RTO and prove restoration in drills. Size from measured workload. Keep SQL Server private; only migration jobs, app identities and approved operations tooling can connect.
-4. **Separate migration from runtime privilege.** Create the database through infrastructure provisioning. Run Flyway once as a controlled release job with a dedicated DDL identity. Application identities need only the required table reads/writes, not `sa` or schema-owner permissions. Disable in-app Flyway with `SPRING_FLYWAY_ENABLED=false` after the release migration; keep Hibernate validation. Use backward-compatible expand/contract migrations so old and new app versions coexist during rollout. Never use destructive automatic migration repair or schema generation.
-5. **Configure identities, secrets and network policy.** Inject DB credentials from a secrets manager, rotate them with tested pool rollover, and use TLS with real certificate validation (`encrypt=true;trustServerCertificate=false`). Give each task minimal IAM permissions. Put application tasks in private subnets. The public listener must route only the external business endpoint; block `/api/v1/internal/**`. Expose CRUD through private ingress with JWT authorization or mTLS and least-privilege policies. Protect or disable Swagger in production. Restrict health and metrics ingress separately. The local app itself has no auth enforcement.
-6. **Deploy to ECS (or Flash's existing platform).** Run the non-root container with measured CPU/memory limits and a read-only root filesystem where possible, allowing temporary storage for the JVM. Terminate client TLS at the approved gateway/ALB and use internal TLS if required. Configure payload limits, rate limiting, request timeouts and connection draining. Route only to `/actuator/health/readiness`-healthy tasks; liveness must not restart every task merely because SQL Server is temporarily down. Readiness includes DB connectivity and startup completion in this implementation.
-7. **Roll out and observe.** Use a rolling or blue-green rollout, keeping enough healthy capacity while new tasks migrate/validate and load matchers. Smoke-test sanitization, CRUD authorization and vocabulary propagation. Watch request rate, latency percentiles, errors, JVM/GC, pool wait time, DB health, refresh duration and configuration version/age. Alert on sustained SLO breaches, failed refreshes, stale matchers and database failures. Do not store chat bodies in routine logs.
-8. **Rollback safely.** Keep the previous image digest and deployment definition. Abort a rollout when health or latency gates fail; restore the prior image while respecting schema compatibility. Rolling back code does not reverse a database migration or administrative vocabulary change. Prefer a forward database fix; restore backups only under a planned recovery procedure with explicit data-loss implications. Test failover, recovery and credential rotation before they become incidents.
+For an exploratory short run:
 
-The in-memory matcher can continue matching during a database outage, but this implementation deliberately marks readiness down when DB health fails because configuration freshness and CRUD cannot be assured. A read-availability-first policy could instead allow a last-known-good snapshot for a defined maximum age; that needs an explicit product/SLO decision, not an accidental health setting.
+```sh
+./mvnw -Pbenchmark compile exec:exec "-Dexec.args=-classpath %classpath org.openjdk.jmh.Main MatcherBenchmark.sanitize -p vocabularySize=228,2000 -p messageLength=1024 -p density=none,dense -wi 2 -i 3 -w 1s -r 1s -f 1 -prof gc"
+```
 
-## Assumptions and trade-offs
+The benchmark profile adds JMH only when selected. Run a clean normal build afterward before packaging the application. [Local benchmark observations](docs/benchmark.md) are algorithm measurements, not HTTP throughput or a production SLO.
 
-- Flash's explicit PDF example is canonical despite the overlapping supplied phrase. The phrase remains seeded and configurable.
-- Vocabulary updates are rare, so simple serialized local writes and full rebuilds are preferable to a complex concurrent incremental matcher.
-- Updates are last-write-wins; there is no edit version/ETag for preventing an administrator from overwriting another administrator's stale edit. Add optimistic concurrency if that workflow requires it.
-- One application instance is supported for immediate configuration visibility. Cross-instance synchronization is a documented production prerequisite, not a hidden implemented feature.
-- No active flag, custom security server, message broker, frontend or orchestration manifests are needed for this assessment.
-- The required original-text response is useful to consumers but can contain private data. Consumers must apply their own response logging/redaction policy.
-- Default verification intentionally runs without Docker. The separate integration profile is required in the production CI gate and fails loudly when Docker cannot run.
+Load-test HTTP separately with realistic Unicode, message distributions and concurrent updates; record p50/p95/p99, CPU, allocations, GC, pool waits and rebuild duration. Establish targets before tuning. If regex dominates at larger vocabularies, benchmark a trie/Aho-Corasick implementation while preserving boundaries and precedence. Batch edits to reduce repeated rebuilds when administrative traffic warrants it. Consider keyset pagination for deep browsing. Increasing the JDBC pool will not improve the database-free sanitize path.
+
+## Production deployment
+
+1. Agree phrase/Unicode semantics, traffic targets, acceptable propagation delay and stale-data policy. The current cross-instance guarantee is periodic eventual consistency, with a configurable freshness deadline.
+2. Run tests and image/security gates. Build once, scan, tag with Git SHA, and promote the same digest through staging and production. Publishing/signing/deployment use Flash's credentials.
+3. Provision a private, supported production SQL Server with suitable licensing, TLS certificates, HA, backups and tested point-in-time restoration. Set RPO/RTO and perform restore drills.
+4. Stop old writers for the V3 upgrade. Run Flyway with a dedicated DDL identity. The runtime profile disables in-app migration and retains Hibernate validation. Grant only the table permissions in the supplied SQL example; never use sa at runtime.
+5. Activate `SPRING_PROFILES_ACTIVE=production`. Supply DB_URL with `encrypt=true;trustServerCertificate=false`, DB_USERNAME, DB_PASSWORD, JWT_ISSUER_URI and JWT_AUDIENCE through managed configuration/secrets. Production refuses development DB settings. JWT issuer/audience validation uses Spring Security; scopes are `sanitize`, `words:read` and `words:write`. Swagger is disabled. Configure Flash's issuer and verify actual issued tokens in staging.
+6. Run non-root tasks in private subnets behind approved TLS ingress. Public routing should allow only the business endpoint; administrative ingress and health remain private despite application authorization. Apply body/rate limits, request deadlines, CPU/memory budgets, connection draining and secret rotation.
+7. **For ECS, use liveness for task/container and ALB target health checks.** Do not attach DB-dependent general health or stale-cache readiness to an automatic replacement policy. ECS can replace tasks that fail ALB health. Use readiness as a release gate and operational signal. During a prolonged outage, the service itself returns 503 once its snapshot expires; task recycling does not repair the database. This consciously trades routing around an individual stale task for avoiding replacement storms. If Flash needs readiness-aware traffic selection, implement it with its gateway without coupling dependency failure to task replacement.
+8. Roll out compatible releases with spare capacity. Check readiness, API authorization, vocabulary propagation and latency before promotion. Monitor dependency health separately from liveness, including refresh failures, revision and duration logs, 503 rates and staleness alerts.
+9. Roll back to an image compatible with the deployed schema and revision protocol. Code rollback does not undo vocabulary changes or database migrations. Use forward fixes where possible; restore backups only under an explicit recovery procedure.
+
+The underlying health decision is deliberate: temporary DB loss permits a previously trusted matcher within its freshness budget; an uncertain local commit immediately invalidates that snapshot. Liveness remains independent of DB reachability.
+
+## Additional enhancements
+
+| Implemented | Still requires Flash's environment or a product decision |
+|---|---|
+| Production JWT scopes, issuer/audience validation | Issuer integration, private ingress, service identity lifecycle and secret rotation |
+| Transactional revision polling and stale-cache refusal | Tighter propagation targets; existing pub/sub plus reconciliation if polling is insufficient |
+| Parameterized operation/ID/revision/duration logs | Durable actor audit history, retention policy, metrics dashboards, tracing/correlation |
+| Tests, JMH, container smoke and vulnerability CI gates | Representative HTTP load tests, signed artifact promotion and actual hosted deployment |
+| Last-write-wins administrative CRUD | Optimistic ETag/version contract if multiple human editors need conflict detection |
+| SQL constraints and migration/runtime separation | Enforced database grants, HA, backup/restore and disaster recovery drills |
+
+No custom identity provider, message broker, frontend, Kubernetes stack or audit platform is included. These would need requirements and infrastructure beyond this take-home.

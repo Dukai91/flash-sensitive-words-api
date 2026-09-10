@@ -1,6 +1,7 @@
 package za.co.flash.sensitivewords.application;
 
 import org.springframework.stereotype.Service;
+import za.co.flash.sensitivewords.domain.TermNormalizer;
 import za.co.flash.sensitivewords.config.SanitizationProperties;
 import za.co.flash.sensitivewords.dto.SanitizeResponse;
 import za.co.flash.sensitivewords.exception.InvalidInputException;
@@ -17,7 +18,7 @@ public class SanitizationService {
     }
 
     public SanitizeResponse sanitize(String text) {
-        if (text == null || text.isBlank()) {
+        if (TermNormalizer.isBlank(text)) {
             throw new InvalidInputException("text must not be blank");
         }
         if (text.length() > properties.maxMessageLength()) {

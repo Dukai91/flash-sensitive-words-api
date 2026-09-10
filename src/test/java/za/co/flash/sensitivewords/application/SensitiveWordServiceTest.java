@@ -40,6 +40,44 @@ class SensitiveWordServiceTest {
     }
 
     @Test
+    void invalidOffsetsNeverReachPersistence() {
+        assertThatThrownBy(() -> service.list(Integer.MAX_VALUE, 100)).isInstanceOf(InvalidInputException.class);
+        verifyNoInteractions(repository);
+        assertThatCode(() -> SensitiveWordService.validatePage(Integer.MAX_VALUE, 1)).doesNotThrowAnyException();
+    }
+
+    @Test
+    void refusesAmbientTransactionsBeforeTouchingDatabase() {
+        org.springframework.transaction.support.TransactionSynchronizationManager.setActualTransactionActive(true);
+        try {
+            assertThatThrownBy(() -> service.create("DROP")).isInstanceOf(IllegalStateException.class);
+            verifyNoInteractions(repository, transactionManager);
+        } finally {
+            org.springframework.transaction.support.TransactionSynchronizationManager.clear();
+        }
+    }
+
+    @Test
+    void failedStartupLeavesMatcherUnavailable() {
+        transaction();
+        when(repository.findAllWords()).thenThrow(new IllegalStateException("unreadable configuration"));
+        assertThatThrownBy(() -> service.run(null)).isInstanceOf(IllegalStateException.class);
+        assertThat(cache.isReady()).isFalse();
+    }
+
+    @Test
+    void pollingOnlyLoadsTermsWhenDatabaseRevisionChanges() {
+        transaction();
+        service.reconcile();
+        verify(repository, never()).findAllWords();
+        when(repository.configurationRevision()).thenReturn(1L);
+        when(repository.findAllWords()).thenReturn(List.of("DROP"));
+        service.reconcile();
+        assertThat(cache.sanitize("CREATE DROP")).isEqualTo("CREATE ****");
+        assertThat(cache.revision()).isEqualTo(1);
+    }
+
+    @Test
     void initializesFromDatabase() {
         transaction();
         when(repository.findAllWords()).thenReturn(List.of("DROP"));
@@ -135,13 +173,16 @@ class SensitiveWordServiceTest {
     }
 
     @Test
-    void failedCommitKeepsPreviousSnapshot() {
+    void failedCommitInvalidatesUntilReconciliationSucceeds() {
         transaction();
         when(repository.saveAndFlush(any())).thenAnswer(call -> call.getArgument(0));
         when(repository.findAllWords()).thenReturn(List.of("DROP"));
         doThrow(new TransactionSystemException("commit failed")).when(transactionManager).commit(any());
         assertThatThrownBy(() -> service.create("DROP")).isInstanceOf(TransactionSystemException.class);
-        assertThat(cache.sanitize("CREATE DROP")).isEqualTo("****** DROP");
+        assertThatThrownBy(() -> cache.sanitize("CREATE DROP")).isInstanceOf(MatcherUnavailableException.class);
+        doNothing().when(transactionManager).commit(any());
+        service.reconcile();
+        assertThat(cache.sanitize("CREATE DROP")).isEqualTo("CREATE ****");
     }
 
     @Test

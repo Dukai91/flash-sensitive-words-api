@@ -25,14 +25,17 @@ import org.springframework.test.context.bean.override.mockito.MockitoBean;
 import org.springframework.test.web.servlet.MockMvc;
 import za.co.flash.sensitivewords.application.*;
 import za.co.flash.sensitivewords.config.SanitizationProperties;
+import za.co.flash.sensitivewords.config.VocabularyProperties;
+import za.co.flash.sensitivewords.config.JsonConfiguration;
+import za.co.flash.sensitivewords.config.SecurityConfiguration;
 import za.co.flash.sensitivewords.dto.SensitiveWordResponse;
 import za.co.flash.sensitivewords.exception.*;
 import za.co.flash.sensitivewords.matcher.*;
 
 @WebMvcTest(controllers = {SanitizationController.class, SensitiveWordController.class},
         properties = "sanitization.max-message-length=50")
-@Import({SanitizationService.class, MatcherCache.class})
-@EnableConfigurationProperties(SanitizationProperties.class)
+@Import({SanitizationService.class, MatcherCache.class, JsonConfiguration.class, SecurityConfiguration.class})
+@EnableConfigurationProperties({SanitizationProperties.class, VocabularyProperties.class})
 class ApiControllerTest {
     private static final String WORDS = "/api/v1/internal/sensitive-words";
     @Autowired private MockMvc mvc;
@@ -56,6 +59,35 @@ class ApiControllerTest {
     }
 
     @ParameterizedTest
+    @ValueSource(strings = {"123", "true", "1.5", "\"CREATE\",\"text\":\"hello\"", "\"hello\"} {\"text\":\"CREATE\""})
+    void rejectsScalarCoercionDuplicateFieldsAndTrailingJson(String value) throws Exception {
+        String body = "{\"text\":" + value + "}";
+        mvc.perform(post("/api/v1/sanitize").contentType(MediaType.APPLICATION_JSON).content(body))
+                .andExpect(status().isBadRequest());
+        String crudBody = body.replace("\"text\"", "\"word\"");
+        mvc.perform(post(WORDS).contentType(MediaType.APPLICATION_JSON).content(crudBody))
+                .andExpect(status().isBadRequest());
+        mvc.perform(put(WORDS + "/7").contentType(MediaType.APPLICATION_JSON).content(crudBody))
+                .andExpect(status().isBadRequest());
+        verifyNoInteractions(words);
+    }
+
+    @Test
+    void rejectsNonBreakingSpaceAndReportsFieldViolationsWithoutValues() throws Exception {
+        mvc.perform(post("/api/v1/sanitize").contentType(MediaType.APPLICATION_JSON).content("{\"text\":\"\\u00a0\"}"))
+                .andExpect(status().isBadRequest());
+        mvc.perform(post(WORDS).contentType(MediaType.APPLICATION_JSON).content("{}"))
+                .andExpect(status().isBadRequest()).andExpect(jsonPath("$.violations[0].field").value("word"))
+                .andExpect(jsonPath("$.violations[0].rejectedValue").doesNotExist());
+    }
+
+    @Test
+    void refusesOversizedHttpBodyBeforeJsonParsing() throws Exception {
+        mvc.perform(post("/api/v1/sanitize").contentType(MediaType.APPLICATION_JSON).content(" ".repeat(2400)))
+                .andExpect(status().isPayloadTooLarge()).andExpect(jsonPath("$.status").value(413));
+    }
+
+    @ParameterizedTest
     @ValueSource(strings = {"{}", "{\"text\":null}", "{\"text\":\" \"}", "{", "null", "[]", "{\"text\":{}}", "{\"text\":\"x\",\"unexpected\":true}"})
     void invalidSanitizeBodyReturnsSafeProblemJson(String body) throws Exception {
         mvc.perform(post("/api/v1/sanitize").contentType(MediaType.APPLICATION_JSON).content(body))
@@ -76,7 +108,7 @@ class ApiControllerTest {
     void createReturnsLocationAndDto() throws Exception {
         when(words.create("SECRET")).thenReturn(response);
         mvc.perform(post(WORDS).contentType(MediaType.APPLICATION_JSON).content("{\"word\":\"SECRET\"}"))
-                .andExpect(status().isCreated()).andExpect(header().string("Location", "http://localhost" + WORDS + "/7"))
+                .andExpect(status().isCreated()).andExpect(header().string("Location", WORDS + "/7"))
                 .andExpect(jsonPath("$.id").value(7)).andExpect(jsonPath("$.word").value("SECRET"))
                 .andExpect(jsonPath("$.normalizedWord").doesNotExist());
     }
@@ -116,7 +148,7 @@ class ApiControllerTest {
     }
 
     @ParameterizedTest
-    @ValueSource(strings = {"/0", "/-1", "/abc", "/99999999999999999999999", "?page=-1", "?size=0", "?size=101", "?page=abc"})
+    @ValueSource(strings = {"/0", "/-1", "/abc", "/99999999999999999999999", "?page=-1", "?size=0", "?size=101", "?page=abc", "?page=2147483647&size=100"})
     void invalidIdsAndPaginationAreBadRequests(String suffix) throws Exception {
         mvc.perform(get(WORDS + suffix)).andExpect(status().isBadRequest())
                 .andExpect(content().contentTypeCompatibleWith(MediaType.APPLICATION_PROBLEM_JSON));

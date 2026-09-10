@@ -27,6 +27,7 @@ services:
     restart: "no"
   app:
     build: .
+    image: flash-sensitive-words:local
     environment:
       DB_URL: "jdbc:sqlserver://sqlserver:1433;databaseName=sensitive_words;encrypt=true;trustServerCertificate=true"
       DB_USERNAME: sa

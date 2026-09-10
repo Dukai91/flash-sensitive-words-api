@@ -5,7 +5,8 @@ import java.time.Instant;
 import org.hibernate.annotations.JdbcTypeCode;
 import org.hibernate.annotations.Nationalized;
 import org.hibernate.type.SqlTypes;
-import za.co.flash.sensitivewords.application.TermNormalizer;
+import za.co.flash.sensitivewords.domain.TermNormalizer;
+import java.time.temporal.ChronoUnit;
 
 @Entity
 @Table(name = "sensitive_words", uniqueConstraints = @UniqueConstraint(
@@ -44,13 +45,13 @@ public class SensitiveWordEntity {
 
     @PrePersist
     void onCreate() {
-        createdAt = Instant.now();
+        createdAt = Instant.now().truncatedTo(ChronoUnit.MICROS);
         updatedAt = createdAt;
     }
 
     @PreUpdate
     void onUpdate() {
-        updatedAt = Instant.now();
+        updatedAt = Instant.now().truncatedTo(ChronoUnit.MICROS);
     }
 
     public Long getId() { return id; }
