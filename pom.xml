@@ -17,7 +17,7 @@
     <springdoc.version>2.8.17</springdoc.version>
     <!-- Security overrides; remove when the Boot BOM supplies equivalent patched versions. -->
     <tomcat.version>10.1.59</tomcat.version>
-    <mssql-jdbc.version>13.4.0.jre11</mssql-jdbc.version>
+    <mssql-jdbc.version>13.6.0.jre11</mssql-jdbc.version>
   </properties>
   <dependencies>
     <dependency>
