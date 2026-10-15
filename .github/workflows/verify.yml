@@ -22,7 +22,7 @@ jobs:
       - name: Verify deployed HTTP contracts
         run: python3 scripts/smoke.py
       - name: Scan application dependencies and runtime image
-        uses: aquasecurity/trivy-action@d2a0b60797ff03db6132bd4e2b293f9b37081297
+        uses: aquasecurity/trivy-action@6abccf398f78b4c337599c0656f933d91efb91a0
         with:
           image-ref: flash-sensitive-words:local
           severity: HIGH,CRITICAL
